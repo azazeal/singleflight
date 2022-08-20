@@ -1,0 +1,69 @@
+// Package singleflight implements a call sharing mechanism.
+package singleflight
+
+import (
+	"context"
+	"sync"
+)
+
+// Caller wraps the functionality of the call sharing mechanism.
+//
+// A Caller must not be copied after first use.
+type Caller[K comparable, V any] struct {
+	mu    sync.Mutex
+	calls map[K]*call[V]
+}
+
+type call[V any] struct {
+	mu  sync.RWMutex
+	val V
+	err error
+}
+
+// Call calls fn and returns the results. Concurrent callers sharing a key will also share the results of the first
+// call.
+//
+// fn may access the key passed to Call via KeyFromContext.
+func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Context) (V, error)) (V, error) {
+	caller.mu.Lock()
+
+	if caller.calls == nil {
+		caller.calls = make(map[K]*call[V])
+	}
+
+	// check whether an in-flight call exists for the key
+	if inflight, ok := caller.calls[key]; ok {
+		// an in-flight call exists; attach to it as a reader and return its result once available
+		caller.mu.Unlock()
+		inflight.mu.RLock()
+
+		defer inflight.mu.RUnlock()
+
+		return inflight.val, inflight.err
+	}
+
+	// there's no in-flight call; start one
+	call := new(call[V])
+	call.mu.Lock()
+
+	caller.calls[key] = call
+	caller.mu.Unlock()
+
+	call.val, call.err = fn(context.WithValue(ctx, contextKeyType[K]{}, key))
+
+	// the call has finished; we're still the only active caller so we can mark
+	// this call as no longer taking place by deleting it from the map
+	caller.mu.Lock()
+	call.mu.Unlock()
+	delete(caller.calls, key)
+	caller.mu.Unlock()
+
+	return call.val, call.err
+}
+
+type contextKeyType[K comparable] struct{}
+
+// KeyFromContext returns the key ctx carries. It panics in case ctx carries no key.
+func (c *Caller[K, V]) KeyFromContext(ctx context.Context) K {
+	return ctx.Value(contextKeyType[K]{}).(K)
+}
