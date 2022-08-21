@@ -45,26 +45,30 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var (
-	errNotFound = errors.New("not found")
-	caller      singleflight.Caller[string, int64]
-)
-
 // fetchCustomerID returns the id of the named customer.
 //
 // Concurrent callers of fetchCustomerID will share the result.
 func fetchCustomerID(ctx context.Context, name string) (int64, error) {
-	return caller.Call(ctx, name, func(_ context.Context) (id int64, err error) {
-		time.Sleep(time.Second >> 1)
+	return caller.Call(ctx, name, doFetchCustomerID)
+}
 
-		if name == "customer-1" {
-			id = 1
-		} else {
-			err = errNotFound
-		}
+var (
+	errNotFound = errors.New("not found")
 
-		return
-	})
+	// caller is used by fetchCustomerID to reduce the number of calls to doFetchCustomerID.
+	caller singleflight.Caller[string, int64]
+)
+
+func doFetchCustomerID(ctx context.Context) (id int64, err error) {
+	time.Sleep(time.Millisecond << 7)
+
+	if name := caller.KeyFromContext(ctx); name == "customer-1" {
+		id = 1
+	} else {
+		err = errNotFound
+	}
+
+	return
 }
 
 func renderCode(w http.ResponseWriter, code int) {
