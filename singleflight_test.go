@@ -10,6 +10,12 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+const (
+	longPause = time.Second >> (1 + iota)
+	mediumPause
+	shortPause
+)
+
 func Test(t *testing.T) {
 	t.Parallel()
 
@@ -21,7 +27,7 @@ func Test(t *testing.T) {
 	)
 
 	fn := func(ctx context.Context) (bool, error) {
-		time.Sleep(time.Second >> 1)
+		time.Sleep(shortPause)
 
 		_ = atomic.AddInt64(&executions, 1)
 
@@ -53,19 +59,26 @@ func Test(t *testing.T) {
 	wg.Wait()
 
 	assert.True(t, r1)
-	assert.Same(t, err1, assert.AnError)
+	assert.Same(t, assert.AnError, err1)
 
 	assert.True(t, r2)
-	assert.Same(t, err2, assert.AnError)
+	assert.Same(t, assert.AnError, err2)
 
 	assert.Equal(t, int64(1), executions)
+
+	// ensure further executions once concurrent callers finish
+	r3, err3 := caller.Call(context.Background(), key+"1", fn)
+
+	assert.False(t, r3)
+	assert.Same(t, assert.AnError, err3)
+	assert.Equal(t, int64(2), executions)
 }
 
 func TestSecondaryContextCancellation(t *testing.T) {
 	t.Parallel()
 
 	fn := func(ctx context.Context) (bool, error) {
-		time.Sleep(time.Second)
+		time.Sleep(longPause)
 
 		return true, nil
 	}
@@ -89,11 +102,11 @@ func TestSecondaryContextCancellation(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		time.Sleep(time.Second >> 2)
+		time.Sleep(shortPause)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
-			time.Sleep(time.Second >> 2)
+			time.Sleep(shortPause)
 			cancel()
 		}()
 
@@ -104,9 +117,9 @@ func TestSecondaryContextCancellation(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		time.Sleep(time.Second >> 2)
+		time.Sleep(shortPause)
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second>>1)
+		ctx, cancel := context.WithTimeout(context.Background(), mediumPause)
 		defer cancel()
 
 		got3, err3 = caller.Call(ctx, key, fn)
