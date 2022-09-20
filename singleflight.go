@@ -4,6 +4,8 @@ package singleflight
 import (
 	"context"
 	"sync"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // Caller wraps the functionality of the call sharing mechanism.
@@ -14,8 +16,13 @@ type Caller[K comparable, V any] struct {
 	calls map[K]*call[V]
 }
 
+const (
+	readerWeight = 1 << (30 * iota)
+	writerWeight
+)
+
 type call[V any] struct {
-	mu  sync.RWMutex
+	sem *semaphore.Weighted
 	val V
 	err error
 }
@@ -35,16 +42,21 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	if inflight, ok := caller.calls[key]; ok {
 		// an in-flight call exists; attach to it as a reader and return its result once available
 		caller.mu.Unlock()
-		inflight.mu.RLock()
 
-		defer inflight.mu.RUnlock()
+		if err := inflight.sem.Acquire(ctx, readerWeight); err != nil {
+			var zero V
+			return zero, err
+		}
+		defer inflight.sem.Release(readerWeight)
 
 		return inflight.val, inflight.err
 	}
 
 	// there's no in-flight call; start one
-	call := new(call[V])
-	call.mu.Lock()
+	call := &call[V]{
+		sem: semaphore.NewWeighted(writerWeight),
+	}
+	_ = call.sem.Acquire(context.Background(), writerWeight) // guaranteed to succeed
 
 	caller.calls[key] = call
 	caller.mu.Unlock()
@@ -54,7 +66,7 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	// the call has finished; we're still the only active caller so we can mark
 	// this call as no longer taking place by deleting it from the map
 	caller.mu.Lock()
-	call.mu.Unlock()
+	call.sem.Release(writerWeight)
 	delete(caller.calls, key)
 	caller.mu.Unlock()
 

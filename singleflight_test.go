@@ -11,6 +11,8 @@ import (
 )
 
 func Test(t *testing.T) {
+	t.Parallel()
+
 	const key = "key"
 
 	var (
@@ -57,4 +59,65 @@ func Test(t *testing.T) {
 	assert.Same(t, err2, assert.AnError)
 
 	assert.Equal(t, int64(1), executions)
+}
+
+func TestSecondaryContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	fn := func(ctx context.Context) (bool, error) {
+		time.Sleep(time.Second)
+
+		return true, nil
+	}
+
+	const key = "key"
+	var (
+		caller           Caller[string, bool]
+		got1, got2, got3 bool
+		err1, err2, err3 error
+		wg               sync.WaitGroup
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		got1, err1 = caller.Call(context.Background(), key, fn)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		time.Sleep(time.Second >> 2)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(time.Second >> 2)
+			cancel()
+		}()
+
+		got2, err2 = caller.Call(ctx, key, fn)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		time.Sleep(time.Second >> 2)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second>>1)
+		defer cancel()
+
+		got3, err3 = caller.Call(ctx, key, fn)
+	}()
+
+	wg.Wait()
+
+	assert.True(t, got1)
+	assert.NoError(t, err1)
+	assert.False(t, got2)
+	assert.ErrorIs(t, err2, context.Canceled)
+	assert.False(t, got3)
+	assert.ErrorIs(t, err3, context.DeadlineExceeded)
 }
