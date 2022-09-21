@@ -76,6 +76,6 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 type contextKeyType[K comparable] struct{}
 
 // KeyFromContext returns the key ctx carries. It panics in case ctx carries no key.
-func (caller *Caller[K, V]) KeyFromContext(ctx context.Context) K {
+func (*Caller[K, V]) KeyFromContext(ctx context.Context) K {
 	return ctx.Value(contextKeyType[K]{}).(K)
 }
