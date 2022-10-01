@@ -2,12 +2,11 @@ package singleflight
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
 const (
@@ -31,7 +30,7 @@ func Test(t *testing.T) {
 
 		_ = atomic.AddInt64(&executions, 1)
 
-		return caller.KeyFromContext(ctx) == key, assert.AnError
+		return caller.KeyFromContext(ctx) == key, errAssert
 	}
 
 	var wg sync.WaitGroup
@@ -58,20 +57,19 @@ func Test(t *testing.T) {
 
 	wg.Wait()
 
-	assert.True(t, r1)
-	assert.Same(t, assert.AnError, err1)
+	assertTrue(t, r1)
+	assertError(t, err1)
 
-	assert.True(t, r2)
-	assert.Same(t, assert.AnError, err2)
-
-	assert.Equal(t, int64(1), executions)
+	assertTrue(t, r2)
+	assertError(t, err2)
+	assertEqual(t, executions, 1)
 
 	// ensure further executions once concurrent callers finish
 	r3, err3 := caller.Call(context.Background(), key+"1", fn)
 
-	assert.False(t, r3)
-	assert.Same(t, assert.AnError, err3)
-	assert.Equal(t, int64(2), executions)
+	assertFalse(t, r3)
+	assertError(t, err3)
+	assertEqual(t, executions, 2)
 }
 
 func TestSecondaryContextCancellation(t *testing.T) {
@@ -127,10 +125,72 @@ func TestSecondaryContextCancellation(t *testing.T) {
 
 	wg.Wait()
 
-	assert.True(t, got1)
-	assert.NoError(t, err1)
-	assert.False(t, got2)
-	assert.ErrorIs(t, err2, context.Canceled)
-	assert.False(t, got3)
-	assert.ErrorIs(t, err3, context.DeadlineExceeded)
+	assertTrue(t, got1)
+	assertNil(t, err1)
+	assertFalse(t, got2)
+	assertErrorIs(t, err2, context.Canceled)
+	assertFalse(t, got3)
+	assertErrorIs(t, err3, context.DeadlineExceeded)
+}
+
+func assertEqual[T comparable](t *testing.T, actual, expected T) {
+	t.Helper()
+
+	if actual == expected {
+		return
+	}
+
+	t.Errorf("expected %v, got: %v", expected, actual)
+}
+
+func assertNil(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		return
+	}
+
+	t.Errorf("expected nil, got %v", err)
+}
+
+var errAssert = errors.New("assert error")
+
+func assertError(t *testing.T, actual error) {
+	t.Helper()
+
+	if errAssert == actual { //nolint:errorlint
+		return
+	}
+
+	t.Errorf("expected %q, got %q", errAssert, actual)
+}
+
+func assertErrorIs(t *testing.T, actual, target error) {
+	t.Helper()
+
+	if errors.Is(actual, target) {
+		return
+	}
+
+	t.Errorf("expected the error to be wrapping %q", target)
+}
+
+func assertTrue(t *testing.T, actual bool) {
+	t.Helper()
+
+	if actual {
+		return
+	}
+
+	t.Error("expected true")
+}
+
+func assertFalse(t *testing.T, actual bool) {
+	t.Helper()
+
+	if !actual {
+		return
+	}
+
+	t.Error("expected false")
 }
