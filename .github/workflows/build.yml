@@ -1,4 +1,4 @@
-name: Build
+name: Build Package
 
 on:
   push:
@@ -16,6 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build
-    uses: azazeal/workflows/.github/workflows/golib.yml@v1.0.2
+  call-build:
+    name: Call Build Package
+    uses: azazeal/workflows/.github/workflows/gopkg.yml@master
