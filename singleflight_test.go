@@ -158,7 +158,7 @@ var errAssert = errors.New("assert error")
 func assertError(t *testing.T, actual error) {
 	t.Helper()
 
-	if errAssert == actual { //nolint:errorlint
+	if errAssert == actual { //nolint:errorlint // we're looking for errAssert to be the same as actual
 		return
 	}
 
