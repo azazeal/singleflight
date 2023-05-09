@@ -56,7 +56,7 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	call := &call[V]{
 		sem: semaphore.NewWeighted(writerWeight),
 	}
-	_ = call.sem.Acquire(context.Background(), writerWeight) // guaranteed to succeed
+	_ = call.sem.Acquire(context.Background(), writerWeight) //nolint:contextcheck // guaranteed to succeed
 
 	caller.calls[key] = call
 	caller.mu.Unlock()
