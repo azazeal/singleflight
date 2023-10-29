@@ -1,6 +1,8 @@
-name: Build Package
+name: Build
 
 on:
+  schedule:
+    - cron: "0 6 * * WED"
   push:
     tags-ignore:
       - "**"
@@ -16,6 +18,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  call-ghlint:
+    name: Call Lint Github workflows
+    uses: azazeal/workflows/.github/workflows/ghlint.yml@master
+    permissions:
+      pull-requests: write
+
   call-build:
     name: Call Build Package
     uses: azazeal/workflows/.github/workflows/gopkg.yml@master
+    permissions:
+      pull-requests: write
