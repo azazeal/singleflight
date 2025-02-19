@@ -34,10 +34,6 @@ type call[V any] struct {
 func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Context) (V, error)) (V, error) {
 	caller.mu.Lock()
 
-	if caller.calls == nil {
-		caller.calls = make(map[K]*call[V])
-	}
-
 	// check whether an in-flight call exists for the key
 	if inflight, ok := caller.calls[key]; ok {
 		// an in-flight call exists; attach to it as a reader and return its result once available
@@ -52,25 +48,31 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 		return inflight.val, inflight.err
 	}
 
-	// there's no in-flight call; start one
-	call := &call[V]{
+	// there's no in-flight v; start one
+	v := &call[V]{
 		sem: semaphore.NewWeighted(writerWeight),
 	}
-	_ = call.sem.Acquire(context.Background(), writerWeight) //nolint:contextcheck // guaranteed to succeed
+	_ = v.sem.Acquire(context.Background(), writerWeight) //nolint:contextcheck // guaranteed to succeed
 
-	caller.calls[key] = call
+	if caller.calls == nil {
+		caller.calls = map[K]*call[V]{
+			key: v,
+		}
+	} else {
+		caller.calls[key] = v
+	}
 	caller.mu.Unlock()
 
-	call.val, call.err = fn(context.WithValue(ctx, contextKeyType[K]{}, key))
+	v.val, v.err = fn(context.WithValue(ctx, contextKeyType[K]{}, key))
 
 	// the call has finished; we're still the only active caller so we can mark
 	// this call as no longer taking place by deleting it from the map
 	caller.mu.Lock()
-	call.sem.Release(writerWeight)
+	v.sem.Release(writerWeight)
 	delete(caller.calls, key)
 	caller.mu.Unlock()
 
-	return call.val, call.err
+	return v.val, v.err
 }
 
 type contextKeyType[K comparable] struct{}
