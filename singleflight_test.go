@@ -41,7 +41,7 @@ func Test(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			*r, *err = caller.Call(context.Background(), key, fn)
+			*r, *err = caller.Call(t.Context(), key, fn)
 		}()
 	}
 
@@ -65,7 +65,7 @@ func Test(t *testing.T) {
 	assertEqual(t, executions, 1)
 
 	// ensure further executions once concurrent callers finish
-	r3, err3 := caller.Call(context.Background(), key+"1", fn)
+	r3, err3 := caller.Call(t.Context(), key+"1", fn)
 
 	assertFalse(t, r3)
 	assertError(t, err3)
@@ -93,7 +93,7 @@ func TestSecondaryContextCancellation(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		got1, err1 = caller.Call(context.Background(), key, fn)
+		got1, err1 = caller.Call(t.Context(), key, fn)
 	}()
 
 	wg.Add(1)
@@ -102,7 +102,7 @@ func TestSecondaryContextCancellation(t *testing.T) {
 
 		time.Sleep(shortPause)
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		go func() {
 			time.Sleep(shortPause)
 			cancel()
@@ -117,7 +117,7 @@ func TestSecondaryContextCancellation(t *testing.T) {
 
 		time.Sleep(shortPause)
 
-		ctx, cancel := context.WithTimeout(context.Background(), mediumPause)
+		ctx, cancel := context.WithTimeout(t.Context(), mediumPause)
 		defer cancel()
 
 		got3, err3 = caller.Call(ctx, key, fn)
