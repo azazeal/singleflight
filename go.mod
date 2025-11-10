@@ -2,4 +2,4 @@ module github.com/azazeal/singleflight
 
 go 1.24.0
 
-require golang.org/x/sync v0.17.0
+require golang.org/x/sync v0.18.0
