@@ -1,14 +1,15 @@
 root = true
 
 [*]
-end_of_line = lf
 charset = utf-8
-insert_final_newline = true
-trim_trailing_whitespace = true
-indent_style = space
+end_of_line = lf
 indent_size = 2
+indent_style = space
+insert_final_newline = true
 tab_width = unset
+trim_trailing_whitespace = true
 
 [{go.mod,*.go}]
+indent_size = unset
 indent_style = tab
 tab_width = unset
