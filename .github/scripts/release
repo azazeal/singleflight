@@ -1,0 +1,470 @@
+#!/bin/sh
+#
+# This script cuts releases, i.e. signed tags on the repository's default
+# branch, along with their respective GitHub release. You execute it like this:
+#
+#   .github/scripts/release patch | minor | major | vX.Y.Z [SHA]
+#
+# The local checkout only supplies git plumbing and nothing more. Tags are cut
+# at the tip of origin's default branch, or at SHA, which has to be a commit
+# that branch itself was at: its first-parent line, not a commit that only
+# arrived inside a merge.
+#
+# An explicit version can be given instead of a bump, but only when it is
+# one of the three bumps the commit accepts. An explicit version is
+# therefore a restatement of patch, minor or major, and never a number of
+# its own. New releases move forward with `patch | minor | major`; `vX.Y.Z`
+# is there to fill in a release we forgot to cut earlier.
+#
+# The major version always comes from the module path in go.mod, read at the
+# commit being tagged: a /vN suffix means the tag must be vN.x.y. `major`
+# therefore never invents a new major on its own, which means that before you
+# cut vN.x.y, go.mod must also be suffixed with /vN.
+#
+# The tags the script generates are *always* signed.
+#
+# Needs an authenticated gh at 2.68.0 or newer and a git configured for signing
+# tags.
+
+set -eu
+
+prog=${0##*/}
+REMOTE=origin
+readonly REMOTE
+
+die() {
+  printf '%s: %s\n' "$prog" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<EOF
+usage: $prog {patch|minor|major|vX.Y.Z} [SHA]
+
+  patch    v6.2.3 -> v6.2.4
+  minor    v6.2.3 -> v6.3.0
+  major    opens vN.0.0 for the /vN in go.mod (or v0 -> v1)
+  vX.Y.Z   whichever of the three above it spells out
+
+  SHA      a commit the default branch was at, 7 to 40 hex digits;
+           the head of that branch by default
+EOF
+  exit 2
+}
+
+# fits16 N -> N is a plain decimal (no sign, no leading zero) that fits a
+# signed int16. Every version component that passes through here must; anyone
+# who needs a release past 32767 can afford to amend the script.
+fits16() {
+  case $1 in
+  '' | *[!0-9]* | 0[0-9]*) return 1 ;;
+  esac
+  [ ${#1} -le 5 ] && [ "$1" -le 32767 ]
+}
+
+# newer A B -> A is a higher version than B. Both are plain vX.Y.Z, so a
+# numeric sort of the three fields is the whole comparison.
+newer() {
+  [ "$1" != "$2" ] || return 1
+  [ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" |
+    sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)" = "${1#v}" ]
+}
+
+kind=''
+want=''
+case ${1:-} in
+patch | minor | major) kind=$1 ;;
+v*) want=$1 ;;
+*) usage ;;
+esac
+
+target=''
+case $# in
+1) ;;
+2) target=$2 ;;
+*) usage ;;
+esac
+
+# A spelled out version is checked for shape only here. Whether it is the
+# right version needs go.mod and the tags around the commit, so it waits
+# until both are known.
+if [ -n "$want" ]; then
+  case $want in
+  *.*.*) ;;
+  *) die "$want is not a version: write it as vX.Y.Z" ;;
+  esac
+
+  rest=${want#v}
+  wma=${rest%%.*}
+  rest=${rest#*.}
+  wmi=${rest%%.*}
+  wpa=${rest#*.}
+  for c in "$wma" "$wmi" "$wpa"; do
+    fits16 "$c" ||
+      die "$want is not a version: X, Y and Z must be plain numbers, at most 32767"
+  done
+fi
+
+# The commit is taken as an object id and nothing else. A name would put the
+# local checkout back in charge of what gets tagged, which is the one thing
+# this script does not let it decide.
+if [ -n "$target" ] || [ $# -eq 2 ]; then
+  case $target in
+  *[!0-9a-fA-F]*) die "$target is not a commit id" ;;
+  esac
+  [ ${#target} -ge 7 ] && [ ${#target} -le 40 ] ||
+    die "a commit id is 7 to 40 hex digits, and $target is ${#target}"
+fi
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 'not inside a git repository'
+
+# The editor below is the whole point, and skipping it is silent: git lets the
+# editor be anything, `true` included. So the guard is not the editor, it is
+# the terminal. Right before the tag you type the version back on /dev/tty,
+# which no pipe, heredoc or yes(1) can answer for. Everything a run could
+# never confirm on is probed here, before anything is fetched or generated.
+# All three fds must be terminals, because every prompt lands on stderr; and
+# /dev/tty is probed in a subshell, because a failed redirect on exec, a
+# special builtin, kills POSIX shells on the spot with the message lost.
+[ -t 0 ] && [ -t 1 ] && [ -t 2 ] || die 'there is no terminal, so the notes cannot be reviewed'
+(exec </dev/tty) 2>/dev/null || die '/dev/tty will not open, so the notes cannot be reviewed'
+
+# gh: present, new enough, and logged in. The floor is what `gh release
+# create --fail-on-no-commits` needs: the flag appeared in 2.68.0, and
+# nothing else used here is newer.
+ghver=$(gh --version 2>/dev/null) || die 'gh is not installed'
+ghver=${ghver#gh version }
+ghver=${ghver%% *}
+[ "$(printf '2.68.0\n%s\n' "$ghver" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = 2.68.0 ] ||
+  die "gh $ghver is too old: --fail-on-no-commits needs gh 2.68.0 or newer"
+gh auth status >/dev/null 2>&1 || die 'gh is not authenticated; run: gh auth login'
+
+# The editor the notes will be reviewed in, i.e. whatever `git var
+# GIT_EDITOR` resolves out of core.editor, $VISUAL and $EDITOR.
+editor=$(git var GIT_EDITOR) || die 'could not resolve an editor'
+
+# The repository and its default branch, as GitHub sees them, resolved from
+# $REMOTE's url: gh's own default-repo resolution can point at a different
+# repository than $REMOTE does (a fork, say), and then the notes and the
+# release would target one repository while the tag lands on another.
+url=$(git remote get-url "$REMOTE" 2>/dev/null) || die "there is no $REMOTE remote"
+info=$(gh repo view "$url" --json nameWithOwner,defaultBranchRef \
+  --jq '.nameWithOwner + " " + .defaultBranchRef.name') ||
+  die "could not resolve the GitHub repository behind $REMOTE"
+repo=${info%% *}
+branch=${info##* }
+[ -n "$branch" ] || die "could not resolve the default branch of $repo"
+
+git fetch --quiet --tags --force "$REMOTE" "refs/heads/$branch" ||
+  die "could not fetch $branch and tags from $REMOTE"
+tip=$(git rev-parse --verify --quiet "FETCH_HEAD^{commit}") ||
+  die "could not resolve the head of $branch"
+
+# The commit being tagged. The fetch above is what brings it over, so a
+# commit $branch does not contain is either unknown here or refused. Being
+# contained is still not enough: a merged branch's commits are ancestors of
+# the tip too, but only the first-parent line holds the states $branch
+# itself was at, and a release has to be one of those.
+if [ -n "$target" ]; then
+  sha=$(git rev-parse --verify --quiet "$target^{commit}") ||
+    die "$target is not a commit in this repository"
+  git merge-base --is-ancestor "$sha" "$tip" || die "$target is not on $branch"
+  git rev-list --first-parent "$tip" | grep -qx "$sha" ||
+    die "$target is on $branch only through a merge, so $branch was never at it"
+else
+  sha=$tip
+fi
+short=$(git rev-parse --short "$sha")
+
+git cat-file -e "$sha:go.mod" 2>/dev/null || die "no go.mod at the root of $short"
+mod=$(git show "$sha:go.mod" | awk '$1 == "module" { print $2; exit }')
+[ -n "$mod" ] || die "go.mod at $short has no module directive"
+
+# The majors go.mod permits, highest first. This mirrors x/mod's
+# SplitPathVersion: take the trailing run of digits and dots off, and if what
+# is left ends in "/v", that run is the major version suffix. A suffix is
+# only valid for N >= 2, plainly written. Anything else carries no suffix at
+# all, which in Go means v0 or v1.
+case $mod in
+gopkg.in/*) die "$mod uses the gopkg.in .vN convention, which this script does not handle" ;;
+'"'* | '`'*) die "the module directive at $short is quoted, which this script does not parse" ;;
+esac
+
+num=${mod##*[!0-9.]}
+stem=${mod%"$num"}
+
+major=''
+case $stem in
+*/v)
+  [ -n "$num" ] || die "module path ends in /v with no version"
+  case $num in
+  0 | 1) die "module path ends in /v$num: v0 and v1 carry no suffix, so drop it from go.mod" ;;
+  esac
+  fits16 "$num" || die "module path ends in /v$num: the major must be a plain number, at most 32767"
+  major=$num
+  ;;
+esac
+
+if [ -n "$major" ]; then
+  allowed=$major
+else
+  allowed='1 0'
+fi
+
+# plain -> keep only the plain vX.Y.Z tags out of a list. Pre-releases and
+# anything else take no part in the ordering below.
+plain() {
+  grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+# highest PATTERN -> the highest release tag matching PATTERN that the commit
+# already contains, or nothing.
+highest() {
+  git tag --list --merged "$sha" --sort=v:refname "$1" | plain | tail -n1
+}
+
+released=$(git tag --list --points-at "$sha" | plain | tail -n1)
+[ -z "$released" ] || die "$short is already released as $released"
+
+# What the commit sits between: the highest release it contains, and the
+# lowest release that contains it. Both are read off ancestry, so a release
+# cut on a branch of its own stays out of the way of this one.
+below=$(highest 'v*')
+above=$(git tag --list --contains "$sha" --sort=v:refname 'v*' | plain | head -n1)
+
+# bump TAG KIND -> the next tag. The components are checked before the
+# arithmetic, because $(( )) reads a leading zero as octal (silently on 010,
+# a raw shell error on 08), and checked after it, so the result fits like
+# everything else.
+bump() {
+  _v=${1#v}
+  _ma=${_v%%.*}
+  _v=${_v#*.}
+  _mi=${_v%%.*}
+  _pa=${_v#*.}
+  for _c in "$_ma" "$_mi" "$_pa"; do
+    fits16 "$_c" || die "cannot bump $1: $_c is not a plain number within int16"
+  done
+  case $2 in
+  patch) _pa=$((_pa + 1)) ;;
+  minor)
+    _mi=$((_mi + 1))
+    _pa=0
+    ;;
+  esac
+  for _c in "$_mi" "$_pa"; do
+    fits16 "$_c" || die "cannot bump $1: the result does not fit int16"
+  done
+  printf 'v%s.%s.%s\n' "$_ma" "$_mi" "$_pa"
+}
+
+current=''
+for m in $allowed; do
+  current=$(highest "v$m.*")
+  if [ -n "$current" ]; then
+    break
+  fi
+done
+
+# The three versions the commit accepts, any of which go.mod already agrees
+# with. An empty one is a bump this commit has no room for: patch and minor
+# need a tag in the major go.mod names, and major needs that major to still
+# be unopened.
+patchv=''
+minorv=''
+majorv="v${allowed%% *}.0.0"
+if [ -n "$current" ]; then
+  patchv=$(bump "$current" patch)
+  minorv=$(bump "$current" minor)
+  if [ "${current%%.*}" = "v${allowed%% *}" ]; then
+    majorv=''
+  fi
+elif [ -z "$major" ]; then
+  patchv=$(bump v0.0.0 patch)
+  minorv=$(bump v0.0.0 minor)
+fi
+
+legal=''
+for c in "$patchv:patch" "$minorv:minor" "$majorv:major"; do
+  case $c in
+  :*) continue ;;
+  esac
+  legal="${legal:+$legal, }${c%:*} (${c#*:})"
+done
+
+if [ -n "$want" ]; then
+  case $want in
+  "$patchv" | "$minorv" | "$majorv") next=$want ;;
+  *) die "$short does not take $want; it takes $legal" ;;
+  esac
+else
+  case $kind in
+  patch) next=$patchv ;;
+  minor) next=$minorv ;;
+  major) next=$majorv ;;
+  esac
+
+  if [ -z "$next" ] && [ "$kind" = major ]; then
+    die "v${allowed%% *} is open already, at $current;" \
+      "to start the next major, suffix the module path in go.mod with it first"
+  fi
+
+  # No vN.x.y comes before the commit. Usually vN is simply not open yet
+  # and `major` is the answer; but when vN.0.0 was already cut at a
+  # descendant, the commit sits between the go.mod bump and vN.0.0, where
+  # no version is legal at all.
+  if [ -z "$next" ]; then
+    case $above in
+    "v$major".*)
+      die "go.mod at $short says /v$major, but v$major opens later," \
+        "at $above; no version fits this commit"
+      ;;
+    esac
+
+    die "go.mod at $short says /v$major, but no v$major tag comes before it;" \
+      "run '$prog major${target:+ $target}'"
+  fi
+fi
+
+# Both can still trip: the tags read above are local, so a release cut
+# elsewhere a moment ago shows up only when the remote is asked directly.
+if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+  die "$next already exists locally"
+fi
+# ls-remote says "absent" only with exit code 2. Anything else means the
+# check itself failed, and a failed check must not pass for absence.
+if git ls-remote --exit-code --tags "$REMOTE" "refs/tags/$next" >/dev/null 2>&1; then
+  die "$next already exists on $REMOTE"
+elif [ $? -ne 2 ]; then
+  die "could not check $REMOTE for $next"
+fi
+
+# The tag has to land in the gap the commit sits in, or it would claim to
+# supersede work it does not carry. This is what stops v4.0.0 from being cut
+# at a commit older than v3.9.9.
+if [ -n "$below" ] && ! newer "$next" "$below"; then
+  die "$next is not above $below, which $short already contains"
+fi
+if [ -n "$above" ] && ! newer "$above" "$next"; then
+  die "$next is not below $above, which was cut on top of $short"
+fi
+
+# The notes are diffed against the release below, and GitHub picks when there
+# is none.
+if [ "$sha" = "$tip" ]; then
+  spot="the head of $branch"
+else
+  behind=$(git rev-list --count "$sha..$tip")
+  if [ "$behind" -eq 1 ]; then
+    spot="$branch, 1 commit behind its head"
+  else
+    spot="$branch, $behind commits behind its head"
+  fi
+fi
+printf '%s: tagging %s (%s), on %s\n' "$prog" "$short" \
+  "$(git log -1 --format=%s "$sha")" "$spot" >&2
+printf '%s: preparing %s (notes since %s)\n' "$prog" "$next" "${below:-the first commit}" >&2
+
+set -- -f "tag_name=$next" -f "target_commitish=$sha"
+if [ -n "$below" ]; then
+  set -- "$@" -f "previous_tag_name=$below"
+fi
+
+# The .md suffix is for the editor, just in case it needs it to enable
+# syntax highlighting and spell checking.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+notes=$work/notes.md
+
+# Written to a file rather than piped: sh has no pipefail, so a failing gh
+# would be hidden behind awk succeeding on empty input.
+gh api -X POST "repos/$repo/releases/generate-notes" "$@" --jq .body >"$work/raw" ||
+  die 'could not generate release notes'
+
+# Sectioning, i.e. dependency bumps in a category of their own, is
+# .github/release.yml's job and the API applies it. All that happens here is
+# tidying the source: the HTML comment GitHub stamps on the first line goes,
+# one blank line after a heading, never two in a row, none at the end. This
+# file is read as markdown in an editor before it is rendered anywhere.
+awk '
+  NR == 1 && /^<!--.*-->$/ { next }
+  $0 == "" { pending = 1; next }
+  {
+    cur = ($0 ~ /^#+ /)
+    if (printed && (pending || heading || cur)) print ""
+    print
+    printed = 1
+    pending = 0
+    heading = cur
+  }
+' "$work/raw" >"$notes"
+
+[ -s "$notes" ] || printf '%s\n' "$next" >"$notes"
+
+# Reviewed in the editor resolved at the top, then confirmed by typing the
+# tag back. Nothing exists until both have happened.
+eval "$editor" '"$notes"' || die 'the editor aborted, so nothing was tagged'
+grep -q '[^[:space:]]' "$notes" || die 'the notes are empty, so nothing was tagged'
+
+# The backstop: with the notes still on screen, the version is typed back on
+# the terminal itself, straight from /dev/tty. It asks for the version and
+# not a y, so muscle memory cannot answer it. It also names the commit and
+# what this release follows, because the line that said so has scrolled away
+# behind the notes, and those two are what the typed version has to agree
+# with.
+if [ -n "$below" ]; then
+  prevnote="previous was $below"
+else
+  prevnote='no previous release'
+fi
+printf '%s: type %s to confirm (%s, at %s): ' "$prog" "$next" "$prevnote" "$short" >&2
+reply=''
+IFS= read -r reply </dev/tty || true
+[ "$reply" = "$next" ] || die "that was not $next, so nothing was tagged"
+
+# --cleanup=whitespace is what keeps the notes intact: git tag otherwise
+# strips every line that starts with '#', which is every markdown heading in
+# them. It does that for -F too, with no editor in sight.
+git tag -s -F "$notes" --cleanup=whitespace "$next" "$sha"
+
+# Signing failing silently is what the -s above exists to prevent, so the tag
+# is read back before anything leaves the machine.
+if ! git tag -v "$next" >/dev/null 2>&1; then
+  git tag -d "$next" >/dev/null
+  die 'the tag did not verify, so nothing was pushed'
+fi
+
+git push --quiet "$REMOTE" "refs/tags/$next" ||
+  die "$next was tagged locally but the push failed; retry with: git push $REMOTE $next"
+
+# The release carries the same notes as the tag. It exists because dependabot
+# pulls release notes into the bump pull requests it opens downstream, and a
+# bare tag gives it nothing to pull. --verify-tag refuses to invent a tag if
+# the push above did not land.
+#
+# --fail-on-no-commits would repeat the ancestry guard on GitHub's side, but
+# gh measures it against the repository's *latest* release, not against the
+# release below the tag. A backfilled tag has nothing newer than the latest
+# release, so the flag would always trip; it is only passed when no release
+# sits above the commit.
+if [ -z "$above" ]; then
+  set -- --fail-on-no-commits
+else
+  set --
+fi
+gh release create "$next" \
+  --repo "$repo" \
+  --title "$next" \
+  --notes-file "$notes" \
+  --verify-tag \
+  "$@" ||
+  die "$next is tagged and pushed but the release was not created; retry with:" \
+    "gh release create $next --repo $repo --title $next --notes-from-tag --verify-tag"
+
+# The local branch ref is caught up with the remote, as long as that is a plain
+# fast-forward of a branch no worktree has checked out. git refuses the rest,
+# which is the safe answer, and a pull on that branch is instant anyway since
+# the fetch above already brought the objects over.
+git fetch --quiet "$REMOTE" "refs/heads/$branch:refs/heads/$branch" 2>/dev/null || true
+
+printf '%s: released %s at %s\n' "$prog" "$next" "$short"
