@@ -179,6 +179,31 @@ func TestPanic(t *testing.T) {
 	})
 }
 
+func TestMaybeKeyFromContext(t *testing.T) {
+	t.Parallel()
+
+	const key = "key"
+
+	var caller Caller[string, bool]
+
+	fn := func(ctx context.Context) (bool, error) {
+		k, ok := caller.MaybeKeyFromContext(ctx)
+
+		return k == key && ok, nil
+	}
+
+	got, err := caller.Call(t.Context(), key, fn)
+
+	assertTrue(t, got)
+	assertNil(t, err)
+
+	// a context that no Call produced carries no key
+	k, ok := caller.MaybeKeyFromContext(t.Context())
+
+	assertFalse(t, ok)
+	assertEqual(t, k, "")
+}
+
 func assertEqual[T comparable](t *testing.T, actual, expected T) {
 	t.Helper()
 
