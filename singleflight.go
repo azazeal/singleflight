@@ -18,7 +18,10 @@ type Caller[K comparable, V any] struct {
 }
 
 type call[V any] struct {
-	done chan struct{} // closed once the fields below are set
+	// done is made by the first reader and closed once the fields below are
+	// set; it stays nil when no reader shows up. It is only read and written
+	// under the Caller's mutex.
+	done chan struct{}
 
 	val   V
 	err   error
@@ -41,15 +44,19 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	if inflight, ok := caller.calls[key]; ok {
 		// an in-flight call exists; attach to it as a reader and return
 		// its result once available
+		if inflight.done == nil {
+			inflight.done = make(chan struct{})
+		}
+		done := inflight.done
 		caller.mu.Unlock()
 
 		select {
-		case <-inflight.done:
+		case <-done:
 		case <-ctx.Done():
 			// ctx lost the race or both were ready; take the result if
 			// it's there
 			select {
-			case <-inflight.done:
+			case <-done:
 			default:
 				var zero V
 				return zero, ctx.Err()
@@ -64,9 +71,7 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	}
 
 	// there's no in-flight call; start one
-	v := &call[V]{
-		done: make(chan struct{}),
-	}
+	v := &call[V]{}
 
 	if caller.calls == nil {
 		caller.calls = map[K]*call[V]{
@@ -84,11 +89,15 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 		v.panik = recover()
 
 		// the call has finished; drop it from the map so that later callers
-		// start a new one, then wake the readers
+		// start a new one, then wake the readers, if any. The channel is read
+		// after the delete, so no reader can make one that we would miss.
 		caller.mu.Lock()
 		delete(caller.calls, key)
+		done := v.done
 		caller.mu.Unlock()
-		close(v.done)
+		if done != nil {
+			close(done)
+		}
 
 		if v.panik != nil {
 			panic(v.panik)
