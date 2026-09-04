@@ -4,55 +4,69 @@ package singleflight
 import (
 	"context"
 	"sync"
-
-	"golang.org/x/sync/semaphore"
 )
 
-// Caller wraps the functionality of the call sharing mechanism.
-//
-// A Caller must not be copied after first use.
+// Caller implements a call-sharing mechanism. It must not be copied
+// after first use.
 type Caller[K comparable, V any] struct {
-	mu    sync.Mutex
 	calls map[K]*call[V]
-}
+	mu    sync.Mutex // protects calls
 
-const (
-	readerWeight = 1 << (30 * iota)
-	writerWeight
-)
+	// NOTE(@azazeal): it's atypical to have calls declared
+	// before mu in this struct, but this reduces the struct's
+	// pointer size to 8 from 16.
+}
 
 type call[V any] struct {
-	sem *semaphore.Weighted
-	val V
-	err error
+	done chan struct{} // closed once the fields below are set
+
+	val   V
+	err   error
+	panik any // the value fn panicked with, if it did
 }
 
-// Call calls fn and returns the results. Concurrent callers sharing a key will also share the results of the first
-// call.
+// Call runs fn and returns its results.
 //
-// fn may access the key passed to Call via KeyFromContext.
+// While a call for a key is in flight, further calls for it wait for that call
+// and return its results instead of running fn. If ctx is done before the
+// results are available, Call returns ctx.Err().
+//
+// If fn panics, every caller sharing the call panics with the same value.
+//
+// fn may retrieve the key via [Caller.KeyFromContext].
 func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Context) (V, error)) (V, error) {
 	caller.mu.Lock()
 
 	// check whether an in-flight call exists for the key
 	if inflight, ok := caller.calls[key]; ok {
-		// an in-flight call exists; attach to it as a reader and return its result once available
+		// an in-flight call exists; attach to it as a reader and return
+		// its result once available
 		caller.mu.Unlock()
 
-		if err := inflight.sem.Acquire(ctx, readerWeight); err != nil {
-			var zero V
-			return zero, err
+		select {
+		case <-inflight.done:
+		case <-ctx.Done():
+			// ctx lost the race or both were ready; take the result if
+			// it's there
+			select {
+			case <-inflight.done:
+			default:
+				var zero V
+				return zero, ctx.Err()
+			}
 		}
-		defer inflight.sem.Release(readerWeight)
+
+		if inflight.panik != nil {
+			panic(inflight.panik)
+		}
 
 		return inflight.val, inflight.err
 	}
 
-	// there's no in-flight v; start one
+	// there's no in-flight call; start one
 	v := &call[V]{
-		sem: semaphore.NewWeighted(writerWeight),
+		done: make(chan struct{}),
 	}
-	_ = v.sem.Acquire(context.Background(), writerWeight) //nolint:contextcheck // guaranteed to succeed
 
 	if caller.calls == nil {
 		caller.calls = map[K]*call[V]{
@@ -63,21 +77,41 @@ func (caller *Caller[K, V]) Call(ctx context.Context, key K, fn func(context.Con
 	}
 	caller.mu.Unlock()
 
-	v.val, v.err = fn(context.WithValue(ctx, contextKeyType[K]{}, key))
+	defer func() {
+		// if fn panicked, keep the value so that the readers can re-raise it.
+		// It must be stored before done is closed, since that is what
+		// publishes it to them.
+		v.panik = recover()
 
-	// the call has finished; we're still the only active caller so we can mark
-	// this call as no longer taking place by deleting it from the map
-	caller.mu.Lock()
-	v.sem.Release(writerWeight)
-	delete(caller.calls, key)
-	caller.mu.Unlock()
+		// the call has finished; drop it from the map so that later callers
+		// start a new one, then wake the readers
+		caller.mu.Lock()
+		delete(caller.calls, key)
+		caller.mu.Unlock()
+		close(v.done)
+
+		if v.panik != nil {
+			panic(v.panik)
+		}
+	}()
+
+	v.val, v.err = fn(context.WithValue(ctx, contextKeyType[K]{}, key))
 
 	return v.val, v.err
 }
 
 type contextKeyType[K comparable] struct{}
 
-// KeyFromContext returns the key ctx carries. It panics in case ctx carries no key.
+// MaybeKeyFromContext returns the key ctx carries, which is the key given to
+// the [Caller.Call] that ctx descends from. The boolean reports whether ctx
+// carries a key at all.
+func (*Caller[K, V]) MaybeKeyFromContext(ctx context.Context) (K, bool) {
+	k, ok := ctx.Value(contextKeyType[K]{}).(K)
+	return k, ok
+}
+
+// KeyFromContext is like [Caller.MaybeKeyFromContext], but panics if ctx
+// carries no key.
 func (*Caller[K, V]) KeyFromContext(ctx context.Context) K {
 	return ctx.Value(contextKeyType[K]{}).(K)
 }

@@ -4,74 +4,55 @@
 
 # singleflight
 
-Package singleflight implements a call sharing mechanism.
+Package singleflight implements a call sharing mechanism: while a call for a
+key is in flight, further calls for the same key wait for it and share its
+result instead of starting one of their own.
 
-## Example usage
+## Example
 
 ```go
-// This package demonstrates how an implementation of a HTTP server might use the singleflight
-// package in order to minimize roundtrips to its database.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log"
-	"net/http"
+	"sync"
 	"time"
 
 	"github.com/azazeal/singleflight"
 )
 
 func main() {
-	http.HandleFunc("/", handler)
+	var wg sync.WaitGroup
 
-	if err := http.ListenAndServe(":8080", nil); !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
-	}
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-
-	switch id, err := fetchCustomerID(r.Context(), name); {
-	case err == nil:
-		fmt.Fprintf(w, "%d", id)
-	case errors.Is(err, errNotFound):
-		renderCode(w, http.StatusNotFound)
-	default:
-		renderCode(w, http.StatusInternalServerError)
-	}
-}
-
-// fetchCustomerID returns the id of the named customer.
-//
-// Concurrent callers of fetchCustomerID will share the result.
-func fetchCustomerID(ctx context.Context, name string) (int64, error) {
-	return caller.Call(ctx, name, doFetchCustomerID)
-}
-
-var (
-	errNotFound = errors.New("not found")
-
-	// caller is used by fetchCustomerID to reduce the number of calls to doFetchCustomerID.
-	caller singleflight.Caller[string, int64]
-)
-
-func doFetchCustomerID(ctx context.Context) (id int64, err error) {
-	time.Sleep(time.Millisecond << 7)
-
-	if name := caller.KeyFromContext(ctx); name == "customer-1" {
-		id = 1
-	} else {
-		err = errNotFound
+	for range 3 {
+		wg.Go(func() {
+			v, err := lookups.Call(context.Background(), "world", lookup)
+			fmt.Println(v, err)
+		})
 	}
 
-	return
+	wg.Wait()
 }
 
-func renderCode(w http.ResponseWriter, code int) {
-	http.Error(w, http.StatusText(code), code)
+var lookups singleflight.Caller[string, string]
+
+// lookup stands in for a slow query for the name that ctx carries.
+func lookup(ctx context.Context) (string, error) {
+	name := lookups.KeyFromContext(ctx)
+	fmt.Println("looking up:", name)
+
+	time.Sleep(100 * time.Millisecond)
+
+	return "hello, " + name, nil
 }
+```
+
+The three calls overlap, so `lookup` runs once and all of them get its result:
+
+```
+looking up: world
+hello, world <nil>
+hello, world <nil>
+hello, world <nil>
 ```
