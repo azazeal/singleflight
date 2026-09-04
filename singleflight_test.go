@@ -22,13 +22,13 @@ func Test(t *testing.T) {
 
 	var (
 		caller     Caller[string, bool]
-		executions int64
+		executions atomic.Int64
 	)
 
 	fn := func(ctx context.Context) (bool, error) {
 		time.Sleep(shortPause)
 
-		_ = atomic.AddInt64(&executions, 1)
+		executions.Add(1)
 
 		return caller.KeyFromContext(ctx) == key, errAssert
 	}
@@ -36,13 +36,9 @@ func Test(t *testing.T) {
 	var wg sync.WaitGroup
 
 	doCall := func(r *bool, err *error) {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			*r, *err = caller.Call(t.Context(), key, fn)
-		}()
+		})
 	}
 
 	// start the first caller
@@ -62,14 +58,14 @@ func Test(t *testing.T) {
 
 	assertTrue(t, r2)
 	assertError(t, err2)
-	assertEqual(t, executions, 1)
+	assertEqual(t, executions.Load(), 1)
 
 	// ensure further executions once concurrent callers finish
 	r3, err3 := caller.Call(t.Context(), key+"1", fn)
 
 	assertFalse(t, r3)
 	assertError(t, err3)
-	assertEqual(t, executions, 2)
+	assertEqual(t, executions.Load(), 2)
 }
 
 func TestSecondaryContextCancellation(t *testing.T) {
@@ -89,17 +85,11 @@ func TestSecondaryContextCancellation(t *testing.T) {
 		wg               sync.WaitGroup
 	)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		got1, err1 = caller.Call(t.Context(), key, fn)
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		time.Sleep(shortPause)
 
 		ctx, cancel := context.WithCancel(t.Context())
@@ -109,19 +99,16 @@ func TestSecondaryContextCancellation(t *testing.T) {
 		}()
 
 		got2, err2 = caller.Call(ctx, key, fn)
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		time.Sleep(shortPause)
 
 		ctx, cancel := context.WithTimeout(t.Context(), mediumPause)
 		defer cancel()
 
 		got3, err3 = caller.Call(ctx, key, fn)
-	}()
+	})
 
 	wg.Wait()
 
@@ -131,6 +118,58 @@ func TestSecondaryContextCancellation(t *testing.T) {
 	assertErrorIs(t, err2, context.Canceled)
 	assertFalse(t, got3)
 	assertErrorIs(t, err3, context.DeadlineExceeded)
+}
+
+func TestPanic(t *testing.T) {
+	t.Parallel()
+
+	const key = "key"
+
+	var (
+		caller     Caller[string, bool]
+		executions atomic.Int64
+	)
+
+	fn := func(context.Context) (bool, error) {
+		executions.Add(1)
+
+		time.Sleep(shortPause)
+
+		panic(errAssert)
+	}
+
+	// a poisoned key would block every caller for good; bound the wait so
+	// that the test fails fast instead
+	ctx, cancel := context.WithTimeout(t.Context(), longPause)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	doCall := func(recovered *any) {
+		wg.Go(func() {
+			defer func() { *recovered = recover() }()
+
+			_, _ = caller.Call(ctx, key, fn)
+		})
+	}
+
+	// start the first caller, which panics, and a second one that shares its
+	// call
+	var rec1, rec2 any
+	doCall(&rec1)
+	doCall(&rec2)
+
+	wg.Wait()
+
+	assertEqual[any](t, rec1, errAssert)
+	assertEqual[any](t, rec2, errAssert)
+	assertEqual(t, executions.Load(), 1)
+
+	// the key must be usable again
+	r3, err3 := caller.Call(ctx, key, func(context.Context) (bool, error) { return true, nil })
+
+	assertTrue(t, r3)
+	assertNil(t, err3)
 }
 
 func assertEqual[T comparable](t *testing.T, actual, expected T) {
